@@ -160,14 +160,14 @@ def umount_root_subvol(dir):
     except:
         pass
 
-def mount_root_subvol(mnt):
-    td = mkdtemp()
+def mount_root_subvol(mnt,name):
+    tempdir = mkdtemp(prefix=f"btrfs-clone-root-{name}-")
     info = check_output([opts.btrfs, "filesystem", "show", mnt])
     line = info.decode("ascii").split("\n")[0]
     uuid = re.search(r"uuid: (?P<uuid>[-a-f0-9]*)", line).group("uuid")
-    check_call(["mount", "-o", "subvolid=5", "UUID=%s" % uuid, td])
-    atexit.register(umount_root_subvol, td)
-    return (uuid, td)
+    check_call(["mount", "-o", "subvolid=5", "UUID=%s" % uuid, tempdir])
+    atexit.register(umount_root_subvol, tempdir)
+    return (uuid, tempdir)
 
 def set_all_ro(yesno, subvols, mnt = None):
     if yesno:
@@ -814,8 +814,8 @@ def main():
         print ("unsharing mount namespace")
         os.execvp("unshare", ["unshare", "-m"] + sys.argv + ["--no-unshare"])
 
-    (old_uuid, old_mnt) = mount_root_subvol(opts.old)
-    (new_uuid, new_mnt) = mount_root_subvol(opts.new)
+    (old_uuid, old_mnt) = mount_root_subvol(opts.old,"SRC")
+    (new_uuid, new_mnt) = mount_root_subvol(opts.new,"DST")
 
     msg = None
     if (old_uuid == new_uuid):
