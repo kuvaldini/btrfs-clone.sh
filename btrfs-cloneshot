@@ -1,0 +1,489 @@
+#!/usr/bin/env bash
+
+# shellcheck disable=SC2065  ## test > is redirection, no need this warning
+# shellcheck disable=SC2119  ## $@ could be empty
+# shellcheck source-path=SCRIPTDIR
+ 
+##
+## === BEHAVIOUR ===
+##
+## 0. SRC and DST must be mounted btrfs
+## 1. create read-only snapshot of top-level partition 
+## 2. btrfs send|receive
+## 3. pv is used to track process of copying
+
+##
+## === OPTIONS ===
+##
+## --skip-existing  if subvol exists do not clone it, but check integrity
+## --exclude  do not clone listed subvols
+## --force --FORCE -f -F --overwrite
+## --src-snapshots-only  clone only existing ro snapshots, i.e. produced by snapper
+## --target-keep-ro-cloneshots --target-keep-received-uuid --keep-sent-cloneshots
+## --parallel=ncpu ???
+## --workdir --work-dir= for debug purposes
+## --logdir --logfile for debug purposes
+## --dryrun,--dry-run,-n  do no changes, just show commands to be executed
+## --calc-size-with-du, --no-calc-size-with-du, --force-calc-size-with-du
+## 
+
+##
+## === TODO ===
+##
+## also clone quota groups, they are not designed to be sent via btrfs-send
+## maybe use sqlite for cache
+## create testcases
+## todo maybe self-elevate
+## todo consider use unshare --mount to keep mount hidden from other processes
+##
+
+set -euo pipefail
+shopt -s failglob
+shopt -s lastpipe
+shopt -s huponexit
+shopt -s inherit_errexit
+
+
+readonly VERSION=main-c0-g0000567-b0-buildme
+readonly NPM_VERSION=0.0.0
+
+readonly DEBUG=1
+
+mypath="$( readlink -f "${BASH_SOURCE[0]}" )"
+mydir="$( dirname "$mypath" )"
+myname="$( basename "$mypath" )"
+myname=${myname%.*}  ## remove extension
+readonly mydir myname mypath
+
+# shellcheck source=SCRIPTDIR/utils.bash
+source "$(dirname "$( readlink -f "${BASH_SOURCE[0]}" )")"/utils.bash
+# source "$mydir"/utils.bash
+
+##########################
+##########################
+##########################
+readonly SRC=/dev/dm-0
+readonly DST=/dev/mapper/luks-garudasana
+readonly logdir=$PWD
+##########################
+##########################
+##########################
+
+exec <&-  ## does not accept anything from stdin [performance,error-handling,non-interactive]
+
+# ##todo move to utils.bash
+if var_is_set_not_empty logdir ;then
+   # log_of_rotatelog=$(mktemp)
+   # rotatelog &>"$log_of_rotatelog" || true
+   log_all_to_file(){
+      echoinfo "logging... to file '$logdir/log'"
+      exec 7>&1  ## save current descriptors
+      exec 8>&2
+      exec 4> >( ts "%Y-%m-%dT%H:%M:%S:%z" >"$logdir"/log 2>&1 )
+      exec 5>&4  ## copy
+      # exec 4>"$logdir"/log                        ## stdout goes without timestamp
+      # exec 5> >( ts "%Y-%m-%dT%H:%M:%S:%z" >&4 )  ## stderr timestamped
+      { cat "$log_of_rotatelog" && rm -fv "$log_of_rotatelog" ;} >&5 2>&5
+      exec 1> >( tee -i >(cat >&4) >&7 ) 
+      exec 2> >( tee -i >(cat >&5) >&8 )
+      echoinfo "logging instantiated to file '$logdir/log'"
+   }
+   # log_all_to_file||true
+fi
+
+
+list_subvolumes(){
+   btrfs subvolume list "$1" -tpuqgcR --sort=ogen,gen,rootid,path
+}
+exclude_cloneshot(){
+   grep -vP '(\s+).*?\.cloneshot(\s|$)'
+}
+echo_delete_cloneshots(){
+   btrfs subvolume list / -tpuqgcR --sort=ogen,gen,rootid,path | 
+      grep -P '(\s+).*?\.cloneshot(\s|$)' | awk '{print $1}' | 
+      xargs -n1 echo btrfs -v subvolume delete / -c -i
+}
+
+sqlite_cache_create(){
+   sqlite3 ./temp/btrfs-cloneshot.db3 <<END
+create table subvolumes (
+   main_mount_path, id INTEGER UNIQUE, 
+   gen INTEGER, ogen INTEGER, parent INTEGER, top_level INTEGER, parent_uuid, received_uuid, uuid UNIQUE PRIMARY KEY, 
+   path, ro BOOLEAN, qgroupid, ref_size, exclusive_size, total_size, du_size
+);
+
+CREATE TEMP TABLE column_list AS
+SELECT GROUP_CONCAT(name, ', ') AS columns
+FROM pragma_table_info('subvolumes')
+WHERE name <> 'main_mount_path';
+
+CREATE VIEW src_subvolumes AS 
+SELECT 
+   id, gen, ogen, parent, top_level, parent_uuid, received_uuid, uuid, path, ro, qgroupid, ref_size, exclusive_size, total_size, du_size
+FROM subvolumes
+WHERE
+   main_mount_path = 'src' OR 
+   main_mount_path LIKE 'src/%';
+
+CREATE VIEW dst_subvolumes AS 
+SELECT 
+   id, gen, ogen, parent, top_level, parent_uuid, received_uuid, uuid, path, ro, qgroupid, ref_size, exclusive_size, total_size, du_size
+FROM subvolumes
+WHERE
+   main_mount_path = 'dst' OR 
+   main_mount_path LIKE 'dst/%';
+END
+}
+sqlite_cache(){
+   if ! test -f ./temp/btrfs-cloneshot.db3
+   then sqlite_cache_create
+   fi
+   sqlite3 ./temp/btrfs-cloneshot.db3 2> >(prepend "sqlite3: " | caterrred)
+}
+
+sum_bytes() {
+    perl -e '
+        my $total = 0;
+        foreach (@ARGV) {
+            /^([\d\.]+)(.*)$/;
+            my ($num, $unit) = ($1, $2);
+            my %mult = ( B=>1, KiB=>1024, MiB=>1024**2, GiB=>1024**3, TiB=>1024**4,
+                               KB=>1000,  MB=>1000**2,  GB=>1000**3,  TB=>1000**4);
+            $total += $num * ($mult{$unit} // 1);
+        }
+        if ($total >= 1024**4) { printf "%.2fTiB\n", $total/1024**4 }
+        elsif ($total >= 1024**3) { printf "%.2fGiB\n", $total/1024**3 }
+        elsif ($total >= 1024**2) { printf "%.2fMiB\n", $total/1024**2 }
+        elsif ($total >= 1024) { printf "%.2fKiB\n", $total/1024 }
+        else { printf "%.0fB\n", $total }
+    ' "$@"
+}
+
+table_gen(){
+   local - id gen ogen parent top_level parent_uuid received_uuid uuid path mntpath
+   srcdst=${srcdst:-$(basename "$1")}
+   list_subvolumes "$srcdst" | 
+      tail -n+3 |
+      while read -r id gen ogen parent top_level parent_uuid received_uuid uuid path __leftovers
+      do
+         test -z "$__leftovers" || echowarn "__leftovers is '$__leftovers'"
+         local flag_ro=$(btrfs property get "$srcdst/$path" ro)
+         local ro="${flag_ro#*=}"  ## pure true|false without ro=
+         # size=$(subvol_size "$srcdst/$path")
+         local qgroupid ref_size exclusive_size qpath __qleftovers total_size size du_size=
+         {
+            qgroup "$srcdst" | awk '$4=="'"$path"'"{print $0}' |
+               read -r qgroupid ref_size exclusive_size qpath __qleftovers
+            test -z "$__qleftovers" || echowarn "__qleftovers is '$__leftovers'"
+            test "$path" = "$qpath"
+            total_size=$(sum_bytes "$ref_size" "$exclusive_size") 
+            size=$total_size
+         } ||
+         { 
+            echodbg 'cannot request qgroup for '"$srcdst/$path"', using du'
+            du_size "$srcdst/$path" | read -r du_size __leftovers
+            size=$du_size
+         }
+         echo "id=$id gen=$gen ogen=$ogen parent=$parent top_level=$top_level parent_uuid=$parent_uuid received_uuid=$received_uuid uuid=$uuid path=$path fullpath=$srcdst/$path $flag_ro size=$size"
+         sqlite_cache <<END
+            INSERT INTO subvolumes (
+               main_mount_path, id, gen, ogen, parent, top_level, parent_uuid, received_uuid, uuid, path, ro, 
+               qgroupid, ref_size, exclusive_size, total_size, du_size
+            ) VALUES (
+               '$srcdst', '$id', '$gen', '$ogen', '$parent', '$top_level', '$parent_uuid', '$received_uuid', '$uuid', '$path', '$ro', 
+               '$qgroupid', '$ref_size', '$exclusive_size', '$total_size', '$du_size'
+            );
+END
+      done
+}
+table(){
+   local srcdst=${srcdst:-$(basename "$1")}
+   local table_cache="temp/table.$srcdst.txt"
+   cache "$table_cache" table_gen "$@"
+}
+table_after(){
+   local srcdst=${srcdst:-$(basename "$1")}
+   local table_cache="temp/table.$srcdst.after.txt"
+   cache "$table_cache" table_gen "$@"
+}
+
+qgroup_show(){
+   btrfs qgroup show "$1" | tail -n+3 
+}
+qgroup(){
+   local srcdst=${srcdst:-$(basename "$1")}
+   local qgroup_cache="temp/qgroup.$srcdst.txt"
+   cache "$qgroup_cache" qgroup_show "$@"
+}
+# qgroup_cache_src(){
+#    cache temp/qgroup.src.txt qgroup_show src/
+# }
+# qgroup_cache_dst(){
+#    cache temp/qgroup.dst.txt qgroup_show dst/
+# }
+qgroup_read_vars(){
+   test -t 0 && fatalerr "read_qgroup requires non-terminal input"
+   read -r qgroupid qsize_ref qsize_exclusive qpath __leftovers
+}
+du_size(){
+   local to=13s
+   timeout $to du -xd0 "$@" \
+      || {  err=$?;
+            case $err in
+               124) echowarn "du_size '$srcdst/$path' timed out after $to";; 
+               *)   if ((err>124))
+                     then echowarn "du_size '$srcdst/$path' other timeout error $err"
+                     else echowarn "du_size '$srcdst/$path' failed"
+                     fi
+                     ;;
+            esac
+         }
+   #| awk '{print $1}'
+}
+subvol_size(){
+   size=
+   btrfs qgroup show -f "$srcdst/$path" | tail -n+3 \
+      | read -r qgroupid size qsize_exclusive qpath __leftovers \
+      || { echodbg 'cannot request qgroup for '"$srcdst/$path"', using du'
+            du_size "$srcdst/$path" | read -r size __leftovers
+         }
+   echo "$size"
+}
+subvol_size_from_cache(){
+   size=
+   qgroup_cache_src | grep -P "(^| )qpath=$1(\s|$)" \
+      | read -r qgroupid size qsize_exclusive qpath __leftovers \
+      || { echodbg 'cannot request qgroup for '"$srcdst/$path"', using du'
+            du_size "$srcdst/$path" | read -r size __leftovers \
+               
+         }
+   echo "$size"
+}
+
+assert_stdin_nonterm(){
+   local - funcname="${1:-}"
+   test -t 0 && fatalerr "${funcname:+$funcname }assert_stdin_nonterm requires non-terminal input"
+}
+get_param(){
+   # assert_stdin_nonterm get_param
+   test -t 0 && fatalerr "get_param requires non-terminal input"
+   local - param=$1
+   grep -Po "\s$param=\K.*?(\s|$)"
+}
+# get_params_perl(){
+#    ## from input stream like 
+#    ##   id=1338 gen=34678717 ogen=22254464 parent=1333 top_level=1333 uuid=440db5f6-46b5-cd4a-9df1-eeca75a22d2e path=@/var/lib/pacman fullpath=src/@/var/lib/pacman ro=false size=147.52MiB
+#    ##   id=1342 gen=34678719 ogen=22254599 parent=1333 top_level=1333 uuid=5591e5c3-ed93-8f46-bff7-0009bb225580 path=@/var/lib/waydroid fullpath=src/@/var/lib/waydroid ro=false size=1.16GiB
+#    ## get params provided as comma separated list, i.e. uuid,ro,size
+#    test -t 0 && fatalerr "get_params requires non-terminal input"
+#    local - params="$1"
+#    perl -ne 'my %h = /\b(\w+)=([^\s]*)/g; print join(" ", @h{split /,/, "'"$params"'"}) . "\n"'
+# }
+read_params(){
+   test -t 0 && fatalerr "read_params requires non-terminal input"
+   head -1 | grep -Po "(^| *)(\w+?)=\K.*?( |$)" | xargs | 
+      read -r "$*" __
+}
+assing_vars(){
+   shopt -s lastpipe
+   for each
+   do
+      echo "$each" | IFS='=' read -r varname val
+      declare -n var=${prevarname-}$varname
+      # shellcheck disable=SC2034  ## var will be used externally
+      var="$val"
+   done
+}
+
+grep_non_found_is_ok(){
+   ## error code 1 from grep means pattern not found, consider it is not an error
+   case $? in 1)true;; *)return $?;; esac
+}
+subvolumes_gen(){
+   table "$@" | grep -Po ' path=\K.*? ' || grep_non_found_is_ok
+}
+subvolumes(){
+   local - 
+   srcdst=${srcdst:-$(basename "$1")}
+   subvolumes_cache="temp/subvolumes.$srcdst.txt"
+   cache "$subvolumes_cache" subvolumes_gen "$@"
+}
+cache(){
+   ## 
+   ## usage: cache <filename> <function> [args...]
+   ## behavior: if file exists, show contents, 
+   ##   if not execute function and store output to cache file
+   ## 
+   local cachefile=$1 funcname=$2
+   shift 2
+   { 
+      test -f "$cachefile" && 
+         cat "$cachefile"
+         # && echodbg "got from cache $funcname"
+   } ||
+      $funcname "$@" | tee "$cachefile"
+}
+
+initialize(){
+   #cd "$(mktemp -d )"
+   # cd "$(mktemp --tmpdir= -d btrfs-cloneshot.XXXX)"
+   mkdir -p ./btrfs-cloneshot.tmp
+   cd ./btrfs-cloneshot.tmp
+   echoinfo "PWD $PWD"
+   
+   mkdir -p temp/
+   mount -ttmpfs tmpfs -osize=32M,nosuid,noexec,nodev temp/
+   # shellcheck disable=SC2329  ## function is used in trap
+   uninitialize(){
+      echodbg 'uninitialize finalizing.'
+      # umount -Rf temp/
+      # rm -rf --one-file-system temp/
+   }
+   readonly -f uninitialize
+   trap_append uninitialize EXIT
+}
+
+mount_btrfs()
+{
+   is_block_device(){
+      test -b "$1" &>/dev/null
+   }
+   is_block_device "$SRC" || fatalerr "must be block device SRC '$SRC'" 
+   is_block_device "$DST" || fatalerr "must be block device DST '$DST'" 
+   mkdir -p src dst
+   mount $SRC src
+   mount $DST dst
+   # shellcheck disable=SC2329  ## function is used in trap
+   final_umount(){
+      echodbg 'final_umount finalizing.'
+      umount -Rf src dst
+      test -z "$(ls -A src/)" || fatalerr "src/ was not unmounted properly"
+      test -z "$(ls -A dst/)" || fatalerr "dst/ was not unmounted properly"
+      rm -rf --one-file-system src/ dst/
+      # cd - &>/dev/null
+      #rm -rf --one-file-system $OLDPWD
+   }
+   readonly -f final_umount
+   trap_append final_umount EXIT
+}
+
+integrity_check_rsync(){
+   rsync -n -axAHXS "$@"
+}
+integrity_check(){
+   integrity_check_rsync src dst | tee temp/src2dst.rsync |catdbg #>&2
+   integrity_check_rsync dst src | tee temp/dst2src.rsync |catdbg #>&2
+   if test -s temp/src2dst.rsync -o -s temp/dst2src.rsync
+   then echowarn "integrity_check failed, see differences in $PWD/temp/src2dst.rsync $PWD/temp/dst2src.rsync"
+   fi
+}
+# shellcheck disable=SC2120  ## arguments are optional
+progressbar(){
+   assert_stdin_nonterm progressbar
+   pv -bptrag "$@"
+}
+
+do_clone(){
+   local - subpath="$1" 
+   ## from table src where path=subpath select varname
+   table src/ | grep -P ' path='"$subpath"'(\s|$)' | { read -r line ; prevarname=sub_ assing_vars $line ;}
+   echoinfo "clonning '$subpath'"
+   subdirname="$(dirname "$subpath")"
+   subsize="${sub_size//iB/}"
+   subro="$sub_ro"
+   ## 1. create readonly snapshot for clone
+   ## 2. btrfs send|receive
+   ## 3. 
+   btrfs -v subvolume delete -c src/.cloneshot/"$subpath" 2>/dev/null || true  ## remove old cloneshot if exists
+   btrfs -v subvolume snapshot -r src/{,.cloneshot/}"$subpath"
+   # trap_append 'btrfs subvolume delete "src/.cloneshot/'"$subpath"'"' EXIT
+   btrfs -v subvolume delete -c dst/.recvshot/"$subpath" 2>/dev/null || true  ## Dangerous, todo interactive Y/N or --force or fail
+   test -e dst/"$subpath"           && errreturn "target 'dst/$subpath' exists"  ## todo but if RO and rsync is ok than say job is done, also check receive-uuid
+   mkdir -p dst/.recvshot/"$subdirname"
+   # mkdir -p dst/"$subdirname"
+   btrfs send --compressed-data src/.cloneshot/"$subpath" \
+      | progressbar --size "$subsize" \
+      | btrfs receive dst/"$subdirname"/
+}
+post_clone_snapshot_rw(){
+   ##
+   ## instead of rename(mv) do yet another snapshot
+   ## avoid received subvol's property RO setting false
+   ## and avoid resetting received_uuid, so still is coupled with source
+   ## but anyway source snapshot will be removed...
+   ## so todo keep some log to track uuids
+   ##
+   btrfs subvolume snapshot dst/"$subpath"{.cloneshot,}
+   btrfs property set dst/"$subpath" ro "$subro" ## set flag ro of dst/subvol as in src
+   # btrfs subvolume set-default dst/.cloneshot  ## umount/mount required, mount -oremount does not work
+   # btrfs subvolume delete -c dst/"$subpath".cloneshot ||true  ## -c to sync, wait for actual remove
+   btrfs subvolume delete -c src/"$subpath".cloneshot
+}
+post_clone_mv(){
+   ## 1. set ro false
+   ## 2. maybe rotate existing target dst/subvol
+   ## 3. mv dst/subvol.cloneshot to dst/subvol
+   ## 4. set property ro to original
+   ## 5. remove src/subvol.cloneshot
+   btrfs property set -f dst/"$subpath".cloneshot ro false  ## WARN setting property non-ro drops receive-uuid
+   # mv -T dst/"$subpath"{,.old} || true ##todo_maybe rotate
+   mv -vT dst/"$subpath"{.cloneshot,}
+   btrfs property set dst/"$subpath" ro "$subro" ## set flag ro of dst/subvol as in src
+   btrfs subvolume delete -c src/"$subpath".cloneshot
+}
+post_clone(){
+   ##todo select post clone policy
+   post_clone_mv
+   ## todo_maybe btrfs subvolume set-default dst/.cloneshot  ## umount/mount required, mount -oremount does not work
+}
+do_clone_all(){
+   #trap_append 'btrfs subvolume delete -cR src/.cloneshot/* ; rm -rfv src/.cloneshot'
+   for subvol in $(subvolumes src/)
+   do
+      do_clone "$subvol" || continue
+   done
+}
+do_clone_nonsnapshot(){
+   for subvol in $(subvolumes src/ | grep -v /snapshot )
+   do
+      do_clone "$subvol"
+   done
+}
+
+main()
+{
+   initialize
+   mount_btrfs
+   ## set_default dst/@
+   ## umount and mount again target ar the end
+}
+
+temptest(){
+   initialize
+   echodbg ------ mount_btrfs ------
+   mount_btrfs
+   echodbg ------ table src/ ------
+   table src/ | column -t
+   echodbg ------ table dst/ ------
+   table dst/ | column -t
+   # echodbg ------------
+   # subvolumes src | xargs | column
+   # echodbg ------------
+   # subvolumes dst/ | xargs | column
+   # echodbg ------------
+   # do_clone @log
+   echodbg ---- exit ----
+   exit
+   do_clone_all
+   echodbg ------------
+   table_after dst/
+   echodbg ------------ done -------------
+   integrity_check
+}
+
+if ! [[ "${BASH_SOURCE[0]}" != "${0}" ]] ;then
+   temptest
+   #main
+else
+   echoinfo "$0 is sourced, functions imported, no actual execution"
+fi
